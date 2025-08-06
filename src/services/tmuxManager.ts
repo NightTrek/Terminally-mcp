@@ -190,12 +190,14 @@ export class TmuxManager {
       await execAsync(`tmux -S "${this.socketPath}" send-keys -l -t "${this.sessionName}:${windowId}" '${escapedCommand}'`);
       await execAsync(`tmux -S "${this.socketPath}" send-keys -t "${this.sessionName}:${windowId}" Enter`);
       
-      // Wait for command to complete
-      await sleep(Math.min(timeout / 2, 3000));
+      // Wait for command to complete - use a shorter default wait time for simple commands
+      // For most echo commands, 500ms should be sufficient
+      const waitTime = Math.min(timeout / 4, 500);
+      await sleep(waitTime);
 
       // Send the end marker with exit code
       await execAsync(`tmux -S "${this.socketPath}" send-keys -t "${this.sessionName}:${windowId}" "echo '${endMarker}_EXIT_CODE:'\$?" Enter`);
-      await sleep(200);
+      await sleep(100);
 
       // Capture the pane content
       const { stdout } = await execAsync(
@@ -280,11 +282,16 @@ export class TmuxManager {
       // Execute and get the pane content
       const { stdout } = await execAsync(captureCmd);
 
-      // Clean the output: remove prompt lines and empty lines
+      // Clean the output: remove prompt lines, MCP markers, and empty lines
       const lines = stdout.split('\n');
       const cleanedLines = lines
         .map(line => line.trimEnd()) // Trim trailing whitespace
-        .filter(line => line && !line.includes('➜') && !line.startsWith('$') && !line.startsWith('#')); // Filter prompts/comments/empty
+        .filter(line => {
+          if (!line) return false; // Remove empty lines
+          if (line.includes('➜') || line.startsWith('$') || line.startsWith('#')) return false; // Remove prompts
+          if (line.includes('MCP_START_MARKER') || line.includes('MCP_END_MARKER')) return false; // Remove MCP markers
+          return true;
+        });
 
       return cleanedLines.join('\n').trim(); // Trim final result
 

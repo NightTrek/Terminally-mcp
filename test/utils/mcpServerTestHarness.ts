@@ -165,17 +165,23 @@ export class McpServerTestHarness {
     try {
       console.log('Calling create_tab tool...');
       
-      // First, try to call it directly
       const response = await this.sendRequest<any>('tools/call', {
         name: 'create_tab',
-        arguments: { name }
+        arguments: name ? { name } : {}
       });
       
-      if (!response || !response.window_id) {
+      // Parse the MCP response format
+      if (!response || !response.content || !response.content[0]) {
         throw new Error(`Invalid response from create_tab: ${JSON.stringify(response)}`);
       }
       
-      return response.window_id;
+      const result = JSON.parse(response.content[0].text);
+      
+      if (!result || !result.window_id) {
+        throw new Error(`Invalid result from create_tab: ${JSON.stringify(result)}`);
+      }
+      
+      return result.window_id;
     } catch (error) {
       console.error('Error calling create_tab:', error);
       throw error;
@@ -190,7 +196,14 @@ export class McpServerTestHarness {
       name: 'close_tab',
       arguments: { window_id: windowId }
     });
-    return response.success;
+    
+    // Parse the MCP response format
+    if (!response || !response.content || !response.content[0]) {
+      throw new Error(`Invalid response from close_tab: ${JSON.stringify(response)}`);
+    }
+    
+    const result = JSON.parse(response.content[0].text);
+    return result.success;
   }
 
   /**
@@ -201,7 +214,14 @@ export class McpServerTestHarness {
       name: 'list_tabs',
       arguments: {}
     });
-    return response.tabs;
+    
+    // Parse the MCP response format
+    if (!response || !response.content || !response.content[0]) {
+      throw new Error(`Invalid response from list_tabs: ${JSON.stringify(response)}`);
+    }
+    
+    const result = JSON.parse(response.content[0].text);
+    return result.tabs;
   }
 
   /**
@@ -216,7 +236,14 @@ export class McpServerTestHarness {
         timeout
       }
     });
-    return response.output;
+    
+    // Parse the MCP response format
+    if (!response || !response.content || !response.content[0]) {
+      throw new Error(`Invalid response from execute_command: ${JSON.stringify(response)}`);
+    }
+    
+    const result = JSON.parse(response.content[0].text);
+    return result.output;
   }
 
   /**
@@ -230,6 +257,13 @@ export class McpServerTestHarness {
         history_limit: historyLimit
       }
     });
-    return response.content;
+    
+    // Parse the MCP response format
+    if (!response || !response.content || !response.content[0]) {
+      throw new Error(`Invalid response from read_output: ${JSON.stringify(response)}`);
+    }
+    
+    const result = JSON.parse(response.content[0].text);
+    return result.content;
   }
 }
