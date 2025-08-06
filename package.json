@@ -1,0 +1,37 @@
+{
+  "name": "terminally-mcp",
+  "version": "1.0.0",
+  "description": "MCP Server for controlling terminal sessions via tmux",
+  "main": "build/index.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node build/index.js",
+    "dev": "tsc && node build/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:ui": "vitest --ui"
+  },
+  "keywords": [
+    "mcp",
+    "terminal",
+    "tmux",
+    "ai",
+    "cli"
+  ],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@types/node": "^22.14.1",
+    "@types/uuid": "^10.0.0",
+    "@vitest/ui": "^3.1.1",
+    "typescript": "^5.8.3",
+    "vitest": "^3.1.1"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.10.1",
+    "dotenv": "^16.5.0",
+    "uuid": "^11.1.0",
+    "zod": "^3.24.3"
+  }
+}
