@@ -7,7 +7,7 @@
 export const createTabToolDefinition = {
   name: 'create_tab',
   description: 'Create a new terminal tab',
-  schema: {
+  inputSchema: {
     type: 'object',
     properties: {
       name: {
@@ -16,16 +16,6 @@ export const createTabToolDefinition = {
       }
     },
     required: []
-  },
-  returns: {
-    type: 'object',
-    properties: {
-      window_id: {
-        type: 'string',
-        description: 'The ID of the created tab'
-      }
-    },
-    required: ['window_id']
   }
 };
 
@@ -33,7 +23,7 @@ export const createTabToolDefinition = {
 export const closeTabToolDefinition = {
   name: 'close_tab',
   description: 'Close a terminal tab',
-  schema: {
+  inputSchema: {
     type: 'object',
     properties: {
       window_id: {
@@ -42,16 +32,6 @@ export const closeTabToolDefinition = {
       }
     },
     required: ['window_id']
-  },
-  returns: {
-    type: 'object',
-    properties: {
-      success: {
-        type: 'boolean',
-        description: 'Whether the tab was successfully closed'
-      }
-    },
-    required: ['success']
   }
 };
 
@@ -59,38 +39,10 @@ export const closeTabToolDefinition = {
 export const listTabsToolDefinition = {
   name: 'list_tabs',
   description: 'List all terminal tabs',
-  schema: {
+  inputSchema: {
     type: 'object',
     properties: {},
     required: []
-  },
-  returns: {
-    type: 'object',
-    properties: {
-      tabs: {
-        type: 'array',
-        description: 'List of all terminal tabs',
-        items: {
-          type: 'object',
-          properties: {
-            window_id: {
-              type: 'string',
-              description: 'ID of the tab'
-            },
-            name: {
-              type: 'string',
-              description: 'Name of the tab'
-            },
-            active: {
-              type: 'boolean',
-              description: 'Whether this tab is active'
-            }
-          },
-          required: ['window_id', 'name', 'active']
-        }
-      }
-    },
-    required: ['tabs']
   }
 };
 
@@ -98,7 +50,7 @@ export const listTabsToolDefinition = {
 export const executeCommandToolDefinition = {
   name: 'execute_command',
   description: 'Execute a command in a terminal tab',
-  schema: {
+  inputSchema: {
     type: 'object',
     properties: {
       window_id: {
@@ -115,16 +67,6 @@ export const executeCommandToolDefinition = {
       }
     },
     required: ['window_id', 'command']
-  },
-  returns: {
-    type: 'object',
-    properties: {
-      output: {
-        type: 'string',
-        description: 'Output from the command execution'
-      }
-    },
-    required: ['output']
   }
 };
 
@@ -132,7 +74,7 @@ export const executeCommandToolDefinition = {
 export const readOutputToolDefinition = {
   name: 'read_output',
   description: 'Read the contents of a terminal tab',
-  schema: {
+  inputSchema: {
     type: 'object',
     properties: {
       window_id: {
@@ -145,15 +87,5 @@ export const readOutputToolDefinition = {
       }
     },
     required: ['window_id']
-  },
-  returns: {
-    type: 'object',
-    properties: {
-      content: {
-        type: 'string',
-        description: 'Content of the terminal tab'
-      }
-    },
-    required: ['content']
   }
 };

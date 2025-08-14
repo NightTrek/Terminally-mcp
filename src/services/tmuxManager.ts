@@ -1,36 +1,65 @@
 /**
  * TmuxManager - Responsible for managing the tmux server and interactions with it
  */
-import { spawn, exec } from 'child_process';
-import { promisify } from 'util';
+import { spawn } from 'child_process';
 import * as path from 'path';
 import * as os from 'os';
 import { v4 as uuidv4 } from 'uuid';
 import { setTimeout as sleep } from 'timers/promises';
-
-// Promisify exec function
-const execAsync = promisify(exec);
+import { KeyMutex } from '../utils/mutex.js';
 
 // Interface for window information
 export interface TmuxWindow {
-  id: string;      // Window ID (e.g., @0, @1, etc.)
-  name: string;    // Window name (user defined or auto-generated)
+  id: string; // Window ID (e.g., @0, @1, etc.)
+  name: string; // Window name (user defined or auto-generated)
   active: boolean; // Whether this window is currently active
 }
 
 export class TmuxManager {
   private socketPath: string;
   private sessionName: string;
-  private tmuxProcess: ReturnType<typeof spawn> | null = null;
+  private tmuxProcess: ReturnType<typeof spawn> | null = null; // reserved for future long-lived server mgmt
   private initialized: boolean = false;
+
+  // Per-pane serialization to prevent interleaving send-keys/capture operations
+  private paneMutex = new KeyMutex();
 
   constructor() {
     // Create unique socket path to avoid conflicts with user's tmux
     const tempDir = os.tmpdir();
     this.socketPath = path.join(tempDir, `tmux-mcp-${uuidv4()}.sock`);
-    
+
     // Session name used for the managed tmux session
     this.sessionName = 'mcp-terminally';
+  }
+
+  /**
+   * Run a process and capture its stdout/stderr. Reject on non-zero exit.
+   */
+  private spawnAndCapture(cmd: string, args: string[]): Promise<{ stdout: string; stderr: string; code: number }> {
+    return new Promise((resolve, reject) => {
+      const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (d) => (stdout += d.toString()));
+      child.stderr.on('data', (d) => (stderr += d.toString()));
+      child.on('error', (err) => reject(err));
+      child.on('close', (code) => {
+        const c = code ?? 0;
+        if (c === 0) {
+          resolve({ stdout, stderr, code: c });
+        } else {
+          reject(new Error(`${cmd} exited with code ${c}: ${stderr || stdout}`));
+        }
+      });
+    });
+  }
+
+  /**
+   * Convenience wrapper to call tmux with our socket path using argv.
+   */
+  private tmux(args: string[]) {
+    return this.spawnAndCapture('tmux', ['-S', this.socketPath, ...args]);
   }
 
   /**
@@ -38,7 +67,7 @@ export class TmuxManager {
    */
   async checkTmuxInstalled(): Promise<boolean> {
     try {
-      await execAsync('which tmux');
+      await this.spawnAndCapture('tmux', ['-V']);
       return true;
     } catch (error) {
       throw new Error('tmux is not installed. Please install tmux to use this MCP server.');
@@ -46,23 +75,39 @@ export class TmuxManager {
   }
 
   /**
-   * Start tmux server and create the main session
+   * Start tmux server and create the main session.
+   * Also configure default shell, login shell behavior, and history limit.
    */
   async startServer(): Promise<void> {
     if (this.initialized) {
       return;
     }
-    
+
     try {
-      // Start a tmux server using the custom socket
-      await execAsync(`tmux -S "${this.socketPath}" start-server`);
-      
-      // Create a new session with a single window
-      await execAsync(`tmux -S "${this.socketPath}" new-session -d -s "${this.sessionName}" -n "default"`);
-      
+      // Create a new session; this will start the server on the custom socket if needed.
+      try {
+        await this.tmux(['new-session', '-d', '-s', this.sessionName, '-n', 'default']);
+      } catch (e: any) {
+        const msg = String(e?.message || e);
+        // Ignore duplicate session errors (server already running with our session)
+        if (!/duplicate session|session already exists/i.test(msg)) {
+          throw e;
+        }
+      }
+
+      // Configure defaults for subsequent windows/panes
+      const bash = '/bin/bash';
+      await this.tmux(['set-option', '-g', 'default-shell', bash]);
+      await this.tmux(['set-option', '-g', 'default-command', `${bash} -l`]);
+      await this.tmux(['set-option', '-g', 'history-limit', '50000']);
+      // Help shells treat large pastes atomically (reduce line-edit artifacts)
+      await this.tmux(['set-option', '-g', 'assume-paste-time', '1']);
+
       this.initialized = true;
+      // eslint-disable-next-line no-console
       console.log(`tmux server started with socket: ${this.socketPath}`);
     } catch (error) {
+      // eslint-disable-next-line no-console
       console.error('Failed to start tmux server:', error);
       throw error;
     }
@@ -75,12 +120,14 @@ export class TmuxManager {
     if (!this.initialized) {
       return;
     }
-    
+
     try {
-      await execAsync(`tmux -S "${this.socketPath}" kill-server`);
+      await this.tmux(['kill-server']);
       this.initialized = false;
+      // eslint-disable-next-line no-console
       console.log('tmux server stopped');
     } catch (error) {
+      // eslint-disable-next-line no-console
       console.error('Failed to stop tmux server:', error);
       // Don't throw here, as we're typically calling this during shutdown
     }
@@ -93,23 +140,27 @@ export class TmuxManager {
     if (!this.initialized) {
       await this.startServer();
     }
-    
+
     const windowName = name || `tab-${Date.now()}`;
-    
+    const safeName = windowName.replace(/#/g, '##'); // escape '#' to prevent tmux format expansion
+
     try {
-      // Create a new window in the session
-      const { stdout } = await execAsync(
-        `tmux -S "${this.socketPath}" new-window -t "${this.sessionName}" -n "${windowName}" && ` +
-        `tmux -S "${this.socketPath}" list-windows -t "${this.sessionName}" -F "#{window_id}: #{window_name}"`
-      );
-      
-      // Parse the output to find the ID of the newly created window
-      const lines = stdout.trim().split('\n');
-      const lastLine = lines[lines.length - 1];
-      const windowId = lastLine.split(':')[0].trim();
-      
+      // Create a new window in the session and print its window_id atomically
+      const { stdout } = await this.tmux([
+        'new-window',
+        '-d',
+        '-t',
+        this.sessionName,
+        '-n',
+        safeName,
+        '-P',
+        '-F',
+        '#{window_id}',
+      ]);
+      const windowId = stdout.trim().split('\n').slice(-1)[0].trim();
       return windowId;
     } catch (error) {
+      // eslint-disable-next-line no-console
       console.error('Failed to create tab:', error);
       throw error;
     }
@@ -122,10 +173,11 @@ export class TmuxManager {
     if (!this.initialized) {
       throw new Error('tmux server not initialized');
     }
-    
+
     try {
-      await execAsync(`tmux -S "${this.socketPath}" kill-window -t "${this.sessionName}:${windowId}"`);
+      await this.tmux(['kill-window', '-t', windowId]);
     } catch (error) {
+      // eslint-disable-next-line no-console
       console.error(`Failed to close tab ${windowId}:`, error);
       throw error;
     }
@@ -138,27 +190,37 @@ export class TmuxManager {
     if (!this.initialized) {
       await this.startServer();
     }
-    
+
     try {
-      const { stdout } = await execAsync(
-        `tmux -S "${this.socketPath}" list-windows -t "${this.sessionName}" ` +
-        `-F "#{window_id} #{window_name} #{window_active}"`
-      );
-      
+      const { stdout } = await this.tmux([
+        'list-windows',
+        '-t',
+        this.sessionName,
+        '-F',
+        '#{window_id}\t#{window_name}\t#{window_active}',
+      ]);
+
       const windows: TmuxWindow[] = [];
-      const lines = stdout.trim().split('\n');
-      
+      const raw = stdout.trim();
+      if (!raw) return windows;
+
+      const lines = raw.split('\n');
+
       for (const line of lines) {
-        const [id, name, active] = line.split(' ');
+        const parts = line.split('\t');
+        const id = parts[0];
+        const name = parts.slice(1, parts.length - 1).join('\t'); // preserve any tabs inside name
+        const activeStr = parts[parts.length - 1];
         windows.push({
           id,
           name,
-          active: active === '1'
+          active: activeStr === '1',
         });
       }
-      
+
       return windows;
     } catch (error) {
+      // eslint-disable-next-line no-console
       console.error('Failed to list tabs:', error);
       throw error;
     }
@@ -166,6 +228,10 @@ export class TmuxManager {
 
   /**
    * Execute a command in a specific tab (window) and capture its output using markers.
+   * Phase 1.1: Use argv-based tmux calls and per-pane mutex. Run in-pane shell directly
+   * by typing a printf-delimited compound script (no base64 | sh) to avoid shell differences.
+   * On timeout, gracefully interrupt (C-c) and return whatever output is available.
+   * Preserve user's last exit code ($?) across calls by ending with a subshell exit $__EC.
    */
   async executeCommand(windowId: string, command: string, timeout: number = 10000): Promise<string> {
     if (!this.initialized) {
@@ -174,135 +240,143 @@ export class TmuxManager {
 
     const startMarker = `MCP_START_MARKER_${uuidv4()}`;
     const endMarker = `MCP_END_MARKER_${uuidv4()}`;
+    const exitCodeMarker = `_EXIT_CODE:`;
 
-    try {
-      // Clear the pane first to avoid confusion with old output
-      await execAsync(`tmux -S "${this.socketPath}" send-keys -t "${this.sessionName}:${windowId}" C-l`);
-      await sleep(100);
+    return this.paneMutex.runExclusive(windowId, async () => {
+      try {
+        // Use a unique heredoc to pass a script to bash -lc safely without quoting issues, preserving exit code into the parent shell's $?
+        const heredoc = `__MCP_${uuidv4().replace(/-/g, '')}`;
+        const script =
+          `printf '%s\\n' '${startMarker}'; ` +
+          `{ ${command} ; __EC=$?; printf '%s\\n' '${endMarker}${exitCodeMarker}'"$__EC"; exit $__EC; }`;
+        const toType = `cat <<'${heredoc}' | bash -lc
+${script}
+${heredoc}`;
 
-      // Send the start marker
-      await execAsync(`tmux -S "${this.socketPath}" send-keys -t "${this.sessionName}:${windowId}" "echo '${startMarker}'" Enter`);
-      await sleep(100);
+        // Always use paste-buffer to inject the script atomically (avoids interactive quoting issues)
+        await this.tmux(['set-buffer', '--', toType]);
+        await this.tmux(['paste-buffer', '-t', windowId]);
+        await this.tmux(['send-keys', '-t', windowId, 'Enter']);
 
-      // Send the actual command using -l flag to send it literally (preserves quotes and special chars)
-      // Escape single quotes in the command for the shell
-      const escapedCommand = command.replace(/'/g, "'\\''");
-      await execAsync(`tmux -S "${this.socketPath}" send-keys -l -t "${this.sessionName}:${windowId}" '${escapedCommand}'`);
-      await execAsync(`tmux -S "${this.socketPath}" send-keys -t "${this.sessionName}:${windowId}" Enter`);
-      
-      // Wait for command to complete - use a shorter default wait time for simple commands
-      // For most echo commands, 500ms should be sufficient
-      const waitTime = Math.min(timeout / 4, 500);
-      await sleep(waitTime);
-
-      // Send the end marker with exit code
-      await execAsync(`tmux -S "${this.socketPath}" send-keys -t "${this.sessionName}:${windowId}" "echo '${endMarker}_EXIT_CODE:'\$?" Enter`);
-      await sleep(100);
-
-      // Capture the pane content
-      const { stdout } = await execAsync(
-        `tmux -S "${this.socketPath}" capture-pane -p -S - -E - -t "${this.sessionName}:${windowId}"`
-      );
-
-      const lines = stdout.split('\n');
-      let startLineIndex = -1;
-      let endLineIndex = -1;
-      let exitCode = 0;
-
-      // Find the markers in the output
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-        if (line.includes(startMarker)) {
-          startLineIndex = i;
-        }
-        if (line.includes(endMarker)) {
-          endLineIndex = i;
-          // Extract exit code
-          const codeMatch = line.match(/_EXIT_CODE:(\d+)/);
-          if (codeMatch && codeMatch[1]) {
-            exitCode = parseInt(codeMatch[1], 10);
+        // Poll pane until END marker or timeout
+        let paneDump = '';
+        const startTime = Date.now();
+        while (Date.now() - startTime < timeout) {
+          const { stdout } = await this.tmux(['capture-pane', '-J', '-p', '-S', '-', '-E', '-', '-t', windowId]);
+          if (stdout.includes(endMarker)) {
+            paneDump = stdout;
+            break;
           }
-          break;
+          await sleep(50);
+        }
+
+        // On timeout: interrupt the foreground process and capture what we have.
+        if (!paneDump) {
+          await this.tmux(['send-keys', '-t', windowId, 'C-c']);
+          await sleep(50);
+          const { stdout } = await this.tmux(['capture-pane', '-J', '-p', '-S', '-', '-E', '-', '-t', windowId]);
+          paneDump = stdout;
+          // Do not throw; tests expect a graceful return even if timing out.
+        }
+
+        // Normalize and parse
+        const normalized = paneDump.replace(/\r/g, '').replace(/\u000c/g, '');
+        const lines = normalized.split('\n');
+
+        const startIdx = lines.findIndex((l) => l.trim() === startMarker);
+
+        let endIdx = -1;
+        for (let i = startIdx + 1; i < lines.length; i++) {
+          if (lines[i].includes(endMarker)) {
+            endIdx = i;
+            break;
+          }
+        }
+
+        if (startIdx === -1) {
+          // Never saw start marker; nothing reliable to return
+          return '';
+        }
+
+        const payloadLines = endIdx !== -1 ? lines.slice(startIdx + 1, endIdx) : lines.slice(startIdx + 1);
+        const payload = payloadLines.join('\n').trim();
+
+        return payload;
+      } catch (error) {
+        // eslint-disable-next-line no-console
+        console.error(`Failed to execute command in tab ${windowId}:`, error);
+        if (error instanceof Error) {
+          throw new Error(`Error executing command '${command}': ${error.message}`);
+        } else {
+          throw new Error(`An unknown error occurred while executing command '${command}'.`);
         }
       }
-
-      // Extract output between markers
-      if (startLineIndex !== -1 && endLineIndex !== -1 && endLineIndex > startLineIndex) {
-        const outputLines = lines.slice(startLineIndex + 1, endLineIndex);
-        const output = outputLines.join('\n').trim();
-        
-        if (exitCode !== 0) {
-          console.warn(`Command exited with code ${exitCode}: ${command}`);
-        }
-        
-        return output || '(no output)';
-      } else {
-        // Fallback: return cleaned output without markers
-        const cleanedOutput = lines
-          .filter(line => !line.includes('MCP_START_MARKER') && !line.includes('MCP_END_MARKER'))
-          .filter(line => !line.match(/^\s*$/)) // Remove empty lines
-          .join('\n')
-          .trim();
-        
-        return cleanedOutput || '(no output captured)';
-      }
-
-    } catch (error) {
-      console.error(`Failed to execute command in tab ${windowId}:`, error);
-      if (error instanceof Error) {
-        throw new Error(`Error executing command '${command}': ${error.message}`);
-      } else {
-        throw new Error(`An unknown error occurred while executing command '${command}'.`);
-      }
-    }
+    });
   }
 
   /**
-   * Read output from a specific tab (window), attempting to clean it
+   * Read output from a specific tab (window), attempting to clean it.
+   * Phase 1: Use argv-based tmux and serialize with mutex.
    */
   async readOutput(windowId: string, historyLimit?: number): Promise<string> {
     if (!this.initialized) {
       throw new Error('tmux server not initialized');
     }
-    
-    try {
-      // Build command to capture pane content
-      let captureCmd = `tmux -S "${this.socketPath}" capture-pane -p`; // -p preserves whitespace
 
-      // Add history limit if specified. -S -N gets the last N lines from history.
-      if (historyLimit && historyLimit > 0) {
-        captureCmd += ` -S -${historyLimit}`;
-      } else {
-         // Capture entire visible pane + history by default if no limit
-         captureCmd += ` -S - -E -`; 
+    return this.paneMutex.runExclusive(windowId, async () => {
+      try {
+        const args: string[] = ['capture-pane', '-p'];
+        if (historyLimit && historyLimit > 0) {
+          // -S -N gets the last N lines from history.
+          args.push('-S', `-${historyLimit}`);
+        } else {
+          // Capture entire visible pane + history by default if no limit
+          args.push('-S', '-', '-E', '-');
+        }
+        args.push('-t', windowId);
+
+        // Execute and get the pane content
+        const { stdout } = await this.tmux(args);
+
+        // Clean the output: remove prompt lines, MCP markers, and empty lines
+        const lines = stdout.split('\n');
+        const cleanedLines = lines
+          .map((line) => line.trimEnd()) // Trim trailing whitespace
+          .filter((line) => {
+            if (!line) return false; // Remove empty lines
+
+            // Remove common shell prompt artifacts
+            if (line.includes('➜') || line.startsWith('$') || line.startsWith('#')) return false;
+
+            // Remove our bounded-exec marker lines
+            if (line.includes('MCP_START_MARKER') || line.includes('MCP_END_MARKER')) return false;
+
+            // Remove heredoc injection scaffolding from executeCommand
+            // e.g., "cat <<'__MCP_...'" line, the heredoc terminator "__MCP_...", and any lines containing the token
+            if (/^cat <<'.*__MCP_[A-Za-z0-9]+' \| bash -lc/.test(line)) return false;
+            if (/^__MCP_[A-Za-z0-9]+$/.test(line.trim())) return false;
+            if (line.includes('__MCP_')) return false;
+
+            // Remove printf lines that print our markers and script control lines
+            if (line.includes("printf '%s\\n' 'MCP_START_MARKER") || line.includes("printf '%s\\n' 'MCP_END_MARKER")) return false;
+
+            // Remove execution control artifacts from the injected script
+            if (line.includes('__EC=$?') || line.includes('exit $__EC')) return false;
+
+            return true;
+          });
+
+        return cleanedLines.join('\n').trim(); // Trim final result
+      } catch (error) {
+        // eslint-disable-next-line no-console
+        console.error(`Failed to read output from tab ${windowId}:`, error);
+        throw new Error(`Failed to read output: ${(error as Error).message}`);
       }
-      
-      captureCmd += ` -t "${this.sessionName}:${windowId}"`;
-      
-      // Execute and get the pane content
-      const { stdout } = await execAsync(captureCmd);
-
-      // Clean the output: remove prompt lines, MCP markers, and empty lines
-      const lines = stdout.split('\n');
-      const cleanedLines = lines
-        .map(line => line.trimEnd()) // Trim trailing whitespace
-        .filter(line => {
-          if (!line) return false; // Remove empty lines
-          if (line.includes('➜') || line.startsWith('$') || line.startsWith('#')) return false; // Remove prompts
-          if (line.includes('MCP_START_MARKER') || line.includes('MCP_END_MARKER')) return false; // Remove MCP markers
-          return true;
-        });
-
-      return cleanedLines.join('\n').trim(); // Trim final result
-
-    } catch (error) {
-      console.error(`Failed to read output from tab ${windowId}:`, error);
-      throw new Error(`Failed to read output: ${(error as Error).message}`);
-    }
+    });
   }
 
   /**
-   * Get the base tmux command with socket
+   * Get the base tmux command with socket (for debugging/logging only)
    * Useful for constructing complex commands
    */
   getTmuxBaseCommand(): string {

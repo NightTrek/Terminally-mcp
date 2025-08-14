@@ -36,14 +36,7 @@ export class TerminallyServer {
       },
       {
         capabilities: {
-          protocolVersion: '0.3',
-          tools: {
-            create_tab: createTabToolDefinition,
-            close_tab: closeTabToolDefinition,
-            list_tabs: listTabsToolDefinition,
-            execute_command: executeCommandToolDefinition,
-            read_output: readOutputToolDefinition
-          }
+          tools: {}
         }
       }
     );
@@ -75,34 +68,13 @@ export class TerminallyServer {
    * Registers tool handlers with the MCP server
    */
   private setupToolHandlers() {
-    // Define server capabilities handler
-    
-    // Register server capabilities handler using proper Zod schema
-    const ServerCapabilitiesSchema = z.object({
-      method: z.literal('server/capabilities'),
-      params: z.object({}).optional()
-    });
-    
-    this.server.setRequestHandler(ServerCapabilitiesSchema, async () => {
-      return {
-        protocolVersion: '0.3',
-        tools: {
-          create_tab: createTabToolDefinition,
-          close_tab: closeTabToolDefinition,
-          list_tabs: listTabsToolDefinition,
-          execute_command: executeCommandToolDefinition,
-          read_output: readOutputToolDefinition
-        }
-      };
-    });
-
     // Register tool definitions - this handles the 'tools/list' method
     this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
       tools: [
-        createTabToolDefinition, 
-        closeTabToolDefinition, 
-        listTabsToolDefinition, 
-        executeCommandToolDefinition, 
+        createTabToolDefinition,
+        closeTabToolDefinition,
+        listTabsToolDefinition,
+        executeCommandToolDefinition,
         readOutputToolDefinition
       ]
     }));
