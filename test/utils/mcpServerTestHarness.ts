@@ -189,17 +189,17 @@ export class McpServerTestHarness {
   }
 
   /**
-   * Call the close_tab tool
+   * Call the stop_process tool to close a tab (kills the main process)
    */
   async closeTab(windowId: string): Promise<boolean> {
     const response = await this.sendRequest<any>('tools/call', {
-      name: 'close_tab',
+      name: 'stop_process',
       arguments: { window_id: windowId }
     });
     
     // Parse the MCP response format
     if (!response || !response.content || !response.content[0]) {
-      throw new Error(`Invalid response from close_tab: ${JSON.stringify(response)}`);
+      throw new Error(`Invalid response from stop_process: ${JSON.stringify(response)}`);
     }
     
     const result = JSON.parse(response.content[0].text);
@@ -233,7 +233,7 @@ export class McpServerTestHarness {
       arguments: {
         window_id: windowId,
         command,
-        timeout
+        timeout_ms: timeout
       }
     });
     
@@ -247,20 +247,20 @@ export class McpServerTestHarness {
   }
 
   /**
-   * Call the read_output tool
+   * Call the read_logs_from_tab tool
    */
   async readOutput(windowId: string, historyLimit?: number): Promise<string> {
     const response = await this.sendRequest<any>('tools/call', {
-      name: 'read_output',
+      name: 'read_logs_from_tab',
       arguments: {
         window_id: windowId,
-        history_limit: historyLimit
+        lines: historyLimit
       }
     });
     
     // Parse the MCP response format
     if (!response || !response.content || !response.content[0]) {
-      throw new Error(`Invalid response from read_output: ${JSON.stringify(response)}`);
+      throw new Error(`Invalid response from read_logs_from_tab: ${JSON.stringify(response)}`);
     }
     
     const result = JSON.parse(response.content[0].text);

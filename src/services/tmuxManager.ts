@@ -136,17 +136,17 @@ export class TmuxManager {
   /**
    * Create a new tab (window in tmux terminology)
    */
-  async createTab(name?: string): Promise<string> {
+  async createTab(options?: { name?: string; cwd?: string; env?: Record<string, string>; login?: boolean }): Promise<{ window_id: string; name: string }> {
     if (!this.initialized) {
       await this.startServer();
     }
 
-    const windowName = name || `tab-${Date.now()}`;
+    const windowName = options?.name || `tab-${Date.now()}`;
     const safeName = windowName.replace(/#/g, '##'); // escape '#' to prevent tmux format expansion
 
     try {
-      // Create a new window in the session and print its window_id atomically
-      const { stdout } = await this.tmux([
+      // Build command array for new-window
+      const args = [
         'new-window',
         '-d',
         '-t',
@@ -156,9 +156,25 @@ export class TmuxManager {
         '-P',
         '-F',
         '#{window_id}',
-      ]);
+      ];
+
+      // Add working directory if specified
+      if (options?.cwd) {
+        args.push('-c', options.cwd);
+      }
+
+      // Create a new window in the session and print its window_id atomically
+      const { stdout } = await this.tmux(args);
       const windowId = stdout.trim().split('\n').slice(-1)[0].trim();
-      return windowId;
+
+      // Set environment variables if specified
+      if (options?.env) {
+        for (const [key, value] of Object.entries(options.env)) {
+          await this.tmux(['send-keys', '-t', windowId, `export ${key}="${value}"`, 'Enter']);
+        }
+      }
+
+      return { window_id: windowId, name: safeName };
     } catch (error) {
       // eslint-disable-next-line no-console
       console.error('Failed to create tab:', error);
@@ -228,12 +244,9 @@ export class TmuxManager {
 
   /**
    * Execute a command in a specific tab (window) and capture its output using markers.
-   * Phase 1.1: Use argv-based tmux calls and per-pane mutex. Run in-pane shell directly
-   * by typing a printf-delimited compound script (no base64 | sh) to avoid shell differences.
-   * On timeout, gracefully interrupt (C-c) and return whatever output is available.
-   * Preserve user's last exit code ($?) across calls by ending with a subshell exit $__EC.
+   * Commands are executed directly in the shell session, preserving working directory and environment.
    */
-  async executeCommand(windowId: string, command: string, timeout: number = 10000): Promise<string> {
+  async executeCommand(windowId: string, command: string, timeout: number = 10000, stripAnsi: boolean = false): Promise<{ output: string; exit_code: number; timed_out: boolean }> {
     if (!this.initialized) {
       throw new Error('tmux server not initialized');
     }
@@ -244,22 +257,17 @@ export class TmuxManager {
 
     return this.paneMutex.runExclusive(windowId, async () => {
       try {
-        // Use a unique heredoc to pass a script to bash -lc safely without quoting issues, preserving exit code into the parent shell's $?
-        const heredoc = `__MCP_${uuidv4().replace(/-/g, '')}`;
-        const script =
-          `printf '%s\\n' '${startMarker}'; ` +
-          `{ ${command} ; __EC=$?; printf '%s\\n' '${endMarker}${exitCodeMarker}'"$__EC"; exit $__EC; }`;
-        const toType = `cat <<'${heredoc}' | bash -lc
-${script}
-${heredoc}`;
-
-        // Always use paste-buffer to inject the script atomically (avoids interactive quoting issues)
-        await this.tmux(['set-buffer', '--', toType]);
-        await this.tmux(['paste-buffer', '-t', windowId]);
-        await this.tmux(['send-keys', '-t', windowId, 'Enter']);
+        // Execute command directly in the shell session to preserve state
+        await this.tmux(['send-keys', '-t', windowId, `echo '${startMarker}'`, 'Enter']);
+        await sleep(100); // Give time for the command to execute
+        await this.tmux(['send-keys', '-t', windowId, command, 'Enter']);
+        await sleep(100); // Give time for the command to execute
+        await this.tmux(['send-keys', '-t', windowId, `echo '${endMarker}${exitCodeMarker}'$?`, 'Enter']);
+        await sleep(100); // Give time for the command to execute
 
         // Poll pane until END marker or timeout
         let paneDump = '';
+        let timedOut = false;
         const startTime = Date.now();
         while (Date.now() - startTime < timeout) {
           const { stdout } = await this.tmux(['capture-pane', '-J', '-p', '-S', '-', '-E', '-', '-t', windowId]);
@@ -272,11 +280,11 @@ ${heredoc}`;
 
         // On timeout: interrupt the foreground process and capture what we have.
         if (!paneDump) {
+          timedOut = true;
           await this.tmux(['send-keys', '-t', windowId, 'C-c']);
           await sleep(50);
           const { stdout } = await this.tmux(['capture-pane', '-J', '-p', '-S', '-', '-E', '-', '-t', windowId]);
           paneDump = stdout;
-          // Do not throw; tests expect a graceful return even if timing out.
         }
 
         // Normalize and parse
@@ -286,22 +294,53 @@ ${heredoc}`;
         const startIdx = lines.findIndex((l) => l.trim() === startMarker);
 
         let endIdx = -1;
+        let exitCode = 0;
         for (let i = startIdx + 1; i < lines.length; i++) {
           if (lines[i].includes(endMarker)) {
             endIdx = i;
+            // Extract exit code from the end marker line
+            const exitCodeMatch = lines[i].match(new RegExp(`${exitCodeMarker}(\\d+)`));
+            if (exitCodeMatch) {
+              exitCode = parseInt(exitCodeMatch[1], 10);
+            }
             break;
           }
         }
 
         if (startIdx === -1) {
           // Never saw start marker; nothing reliable to return
-          return '';
+          return { output: '', exit_code: timedOut ? 130 : 0, timed_out: timedOut };
         }
 
         const payloadLines = endIdx !== -1 ? lines.slice(startIdx + 1, endIdx) : lines.slice(startIdx + 1);
-        const payload = payloadLines.join('\n').trim();
+        
+        // Filter out shell prompts and command echoes but keep actual output
+        const filteredLines = payloadLines.filter((line) => {
+          const trimmed = line.trim();
+          if (!trimmed) return false;
+          
+          // Remove shell prompts (various formats)
+          if (trimmed.includes('$') && (trimmed.includes('danielsteigman') || trimmed.includes('MacBook'))) return false;
+          if (trimmed.startsWith('(base)') && trimmed.includes('$')) return false;
+          
+          // Remove command echoes (lines that exactly match our command)
+          if (trimmed === command) return false;
+          
+          // Remove printf/echo marker commands
+          if (trimmed.includes('printf') && trimmed.includes('MCP_')) return false;
+          if (trimmed.includes('echo') && trimmed.includes('MCP_')) return false;
+          
+          return true;
+        });
+        
+        let payload = filteredLines.join('\n').trim();
 
-        return payload;
+        // Strip ANSI sequences if requested
+        if (stripAnsi) {
+          payload = this.stripAnsiSequences(payload);
+        }
+
+        return { output: payload, exit_code: exitCode, timed_out: timedOut };
       } catch (error) {
         // eslint-disable-next-line no-console
         console.error(`Failed to execute command in tab ${windowId}:`, error);
@@ -373,6 +412,108 @@ ${heredoc}`;
         throw new Error(`Failed to read output: ${(error as Error).message}`);
       }
     });
+  }
+
+  /**
+   * Read logs from a tab's pipe-pane file (line-count oriented)
+   */
+  async readLogsFromTab(windowId: string, lines: number = 500, stripAnsi: boolean = false): Promise<{ content: string; returned_lines: number; truncated: boolean }> {
+    if (!this.initialized) {
+      throw new Error('tmux server not initialized');
+    }
+
+    return this.paneMutex.runExclusive(windowId, async () => {
+      try {
+        // For now, use capture-pane as a fallback until pipe-pane is implemented
+        const args: string[] = ['capture-pane', '-p'];
+        if (lines > 0) {
+          args.push('-S', `-${lines}`);
+        } else {
+          args.push('-S', '-', '-E', '-');
+        }
+        args.push('-t', windowId);
+
+        const { stdout } = await this.tmux(args);
+        let content = stdout;
+
+        if (stripAnsi) {
+          content = this.stripAnsiSequences(content);
+        }
+
+        const contentLines = content.split('\n');
+        const returnedLines = contentLines.length;
+        const truncated = false; // TODO: implement proper truncation detection
+
+        return {
+          content: content.trim(),
+          returned_lines: returnedLines,
+          truncated
+        };
+      } catch (error) {
+        console.error(`Failed to read logs from tab ${windowId}:`, error);
+        throw new Error(`Failed to read logs: ${(error as Error).message}`);
+      }
+    });
+  }
+
+  /**
+   * Start a long-running process in a tab
+   */
+  async startProcess(windowId: string, command: string, appendNewline: boolean = true): Promise<{ started: boolean }> {
+    if (!this.initialized) {
+      throw new Error('tmux server not initialized');
+    }
+
+    return this.paneMutex.runExclusive(windowId, async () => {
+      try {
+        await this.tmux(['send-keys', '-t', windowId, command]);
+        if (appendNewline) {
+          await this.tmux(['send-keys', '-t', windowId, 'Enter']);
+        }
+        return { started: true };
+      } catch (error) {
+        console.error(`Failed to start process in tab ${windowId}:`, error);
+        throw new Error(`Failed to start process: ${(error as Error).message}`);
+      }
+    });
+  }
+
+  /**
+   * Stop a process in a tab by sending a signal. Can also close the tab by killing the main process.
+   */
+  async stopProcess(windowId: string, signal: string = 'SIGINT'): Promise<{ success: boolean }> {
+    if (!this.initialized) {
+      throw new Error('tmux server not initialized');
+    }
+
+    return this.paneMutex.runExclusive(windowId, async () => {
+      try {
+        if (signal === 'SIGINT') {
+          // Send Ctrl+C to interrupt the current process
+          await this.tmux(['send-keys', '-t', windowId, 'C-c']);
+          // Then send exit to close the shell (which closes the tab)
+          await sleep(100);
+          await this.tmux(['send-keys', '-t', windowId, 'exit', 'Enter']);
+        } else if (signal === 'SIGTERM') {
+          // Send Ctrl+\ for SIGTERM-like behavior, then exit
+          await this.tmux(['send-keys', '-t', windowId, 'C-\\']);
+          await sleep(100);
+          await this.tmux(['send-keys', '-t', windowId, 'exit', 'Enter']);
+        }
+        return { success: true };
+      } catch (error) {
+        console.error(`Failed to stop process in tab ${windowId}:`, error);
+        throw new Error(`Failed to stop process: ${(error as Error).message}`);
+      }
+    });
+  }
+
+  /**
+   * Strip ANSI escape sequences from text
+   */
+  private stripAnsiSequences(text: string): string {
+    // Remove ANSI escape sequences
+    return text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
   }
 
   /**

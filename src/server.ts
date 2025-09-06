@@ -13,8 +13,22 @@ import {
 import { z } from 'zod';
 
 import { TmuxManager } from './services/tmuxManager.js';
-import { createTabToolDefinition, closeTabToolDefinition, listTabsToolDefinition, executeCommandToolDefinition, readOutputToolDefinition } from './tools/definitions.js';
-import { CreateTabToolHandler, CloseTabToolHandler, ListTabsToolHandler, ExecuteCommandToolHandler, ReadOutputToolHandler } from './tools/handlers.js';
+import { 
+  createTabToolDefinition, 
+  listTabsToolDefinition, 
+  readLogsFromTabToolDefinition, 
+  executeCommandToolDefinition, 
+  startProcessToolDefinition, 
+  stopProcessToolDefinition 
+} from './tools/definitions.js';
+import { 
+  CreateTabToolHandler, 
+  ListTabsToolHandler, 
+  ReadLogsFromTabToolHandler, 
+  ExecuteCommandToolHandler, 
+  StartProcessToolHandler, 
+  StopProcessToolHandler 
+} from './tools/handlers.js';
 
 export class TerminallyServer {
   private server: Server;
@@ -22,10 +36,11 @@ export class TerminallyServer {
   
   // Tool handlers
   private createTabToolHandler: CreateTabToolHandler;
-  private closeTabToolHandler: CloseTabToolHandler;
   private listTabsToolHandler: ListTabsToolHandler;
+  private readLogsFromTabToolHandler: ReadLogsFromTabToolHandler;
   private executeCommandToolHandler: ExecuteCommandToolHandler;
-  private readOutputToolHandler: ReadOutputToolHandler;
+  private startProcessToolHandler: StartProcessToolHandler;
+  private stopProcessToolHandler: StopProcessToolHandler;
 
   constructor() {
     // Initialize server
@@ -52,10 +67,11 @@ export class TerminallyServer {
 
     // Initialize tool handlers
     this.createTabToolHandler = new CreateTabToolHandler(this.tmuxManager);
-    this.closeTabToolHandler = new CloseTabToolHandler(this.tmuxManager);
     this.listTabsToolHandler = new ListTabsToolHandler(this.tmuxManager);
+    this.readLogsFromTabToolHandler = new ReadLogsFromTabToolHandler(this.tmuxManager);
     this.executeCommandToolHandler = new ExecuteCommandToolHandler(this.tmuxManager);
-    this.readOutputToolHandler = new ReadOutputToolHandler(this.tmuxManager);
+    this.startProcessToolHandler = new StartProcessToolHandler(this.tmuxManager);
+    this.stopProcessToolHandler = new StopProcessToolHandler(this.tmuxManager);
 
     // Register tool handlers
     this.setupToolHandlers();
@@ -72,10 +88,11 @@ export class TerminallyServer {
     this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
       tools: [
         createTabToolDefinition,
-        closeTabToolDefinition,
         listTabsToolDefinition,
+        readLogsFromTabToolDefinition,
         executeCommandToolDefinition,
-        readOutputToolDefinition
+        startProcessToolDefinition,
+        stopProcessToolDefinition
       ]
     }));
 
@@ -85,29 +102,47 @@ export class TerminallyServer {
         let result;
         switch (request.params.name) {
           case createTabToolDefinition.name:
-            result = await this.createTabToolHandler.handle(request.params.arguments as { name?: string });
-            break;
-          
-          case closeTabToolDefinition.name:
-            result = await this.closeTabToolHandler.handle(request.params.arguments as { window_id: string });
+            result = await this.createTabToolHandler.handle(request.params.arguments as { 
+              name?: string; 
+              cwd?: string; 
+              env?: Record<string, string>; 
+              login?: boolean 
+            });
             break;
           
           case listTabsToolDefinition.name:
             result = await this.listTabsToolHandler.handle();
             break;
           
+          case readLogsFromTabToolDefinition.name:
+            result = await this.readLogsFromTabToolHandler.handle(request.params.arguments as { 
+              window_id: string; 
+              lines?: number; 
+              strip_ansi?: boolean;
+            });
+            break;
+          
           case executeCommandToolDefinition.name:
             result = await this.executeCommandToolHandler.handle(request.params.arguments as { 
               window_id: string; 
               command: string; 
-              timeout?: number;
+              timeout_ms?: number;
+              strip_ansi?: boolean;
             });
             break;
           
-          case readOutputToolDefinition.name:
-            result = await this.readOutputToolHandler.handle(request.params.arguments as { 
+          case startProcessToolDefinition.name:
+            result = await this.startProcessToolHandler.handle(request.params.arguments as { 
               window_id: string; 
-              history_limit?: number;
+              command: string; 
+              append_newline?: boolean;
+            });
+            break;
+          
+          case stopProcessToolDefinition.name:
+            result = await this.stopProcessToolHandler.handle(request.params.arguments as { 
+              window_id: string; 
+              signal?: string;
             });
             break;
           
